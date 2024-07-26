@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,8 +22,8 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/jmorganca/ollama/api"
-	"github.com/jmorganca/ollama/format"
+	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/format"
 )
 
 const maxRetries = 6
@@ -141,6 +142,32 @@ func (b *blobDownload) Run(ctx context.Context, requestURL *url.URL, opts *regis
 	b.err = b.run(ctx, requestURL, opts)
 }
 
+func newBackoff(maxBackoff time.Duration) func(ctx context.Context) error {
+	var n int
+	return func(ctx context.Context) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		n++
+
+		// n^2 backoff timer is a little smoother than the
+		// common choice of 2^n.
+		d := min(time.Duration(n*n)*10*time.Millisecond, maxBackoff)
+		// Randomize the delay between 0.5-1.5 x msec, in order
+		// to prevent accidental "thundering herd" problems.
+		d = time.Duration(float64(d) * (rand.Float64() + 0.5))
+		t := time.NewTimer(d)
+		defer t.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+			return nil
+		}
+	}
+}
+
 func (b *blobDownload) run(ctx context.Context, requestURL *url.URL, opts *registryOptions) error {
 	defer blobDownloadManager.Delete(b.Digest)
 	ctx, b.CancelFunc = context.WithCancel(ctx)
@@ -152,6 +179,52 @@ func (b *blobDownload) run(ctx context.Context, requestURL *url.URL, opts *regis
 	defer file.Close()
 
 	_ = file.Truncate(b.Total)
+
+	directURL, err := func() (*url.URL, error) {
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+
+		backoff := newBackoff(10 * time.Second)
+		for {
+			// shallow clone opts to be used in the closure
+			// without affecting the outer opts.
+			newOpts := new(registryOptions)
+			*newOpts = *opts
+
+			newOpts.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+				if len(via) > 10 {
+					return errors.New("maxium redirects exceeded (10) for directURL")
+				}
+
+				// if the hostname is the same, allow the redirect
+				if req.URL.Hostname() == requestURL.Hostname() {
+					return nil
+				}
+
+				// stop at the first redirect that is not
+				// the same hostname as the original
+				// request.
+				return http.ErrUseLastResponse
+			}
+
+			resp, err := makeRequestWithRetry(ctx, http.MethodGet, requestURL, nil, nil, newOpts)
+			if err != nil {
+				slog.Warn("failed to get direct URL; backing off and retrying", "err", err)
+				if err := backoff(ctx); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusTemporaryRedirect {
+				return nil, fmt.Errorf("unexpected status code %d", resp.StatusCode)
+			}
+			return resp.Location()
+		}
+	}()
+	if err != nil {
+		return err
+	}
 
 	g, inner := errgroup.WithContext(ctx)
 	g.SetLimit(numDownloadParts)
@@ -165,7 +238,7 @@ func (b *blobDownload) run(ctx context.Context, requestURL *url.URL, opts *regis
 			var err error
 			for try := 0; try < maxRetries; try++ {
 				w := io.NewOffsetWriter(file, part.StartsAt())
-				err = b.downloadChunk(inner, requestURL, w, part, opts)
+				err = b.downloadChunk(inner, directURL, w, part, opts)
 				switch {
 				case errors.Is(err, context.Canceled), errors.Is(err, syscall.ENOSPC):
 					// return immediately if the context is canceled or the device is out of space
@@ -221,7 +294,7 @@ func (b *blobDownload) downloadChunk(ctx context.Context, requestURL *url.URL, w
 		}
 		defer resp.Body.Close()
 
-		n, err := io.Copy(w, io.TeeReader(resp.Body, part))
+		n, err := io.CopyN(w, io.TeeReader(resp.Body, part), part.Size-part.Completed)
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.ErrUnexpectedEOF) {
 			// rollback progress
 			b.Completed.Add(-n)
@@ -247,7 +320,8 @@ func (b *blobDownload) downloadChunk(ctx context.Context, requestURL *url.URL, w
 				}
 
 				if !part.lastUpdated.IsZero() && time.Since(part.lastUpdated) > 5*time.Second {
-					slog.Info(fmt.Sprintf("%s part %d stalled; retrying", b.Digest[7:19], part.N))
+					const msg = "%s part %d stalled; retrying. If this persists, press ctrl-c to exit, then 'ollama pull' to find a faster connection."
+					slog.Info(fmt.Sprintf(msg, b.Digest[7:19], part.N))
 					// reset last updated
 					part.lastUpdated = time.Time{}
 					return errPartStalled
@@ -339,17 +413,17 @@ type downloadOpts struct {
 }
 
 // downloadBlob downloads a blob from the registry and stores it in the blobs directory
-func downloadBlob(ctx context.Context, opts downloadOpts) error {
+func downloadBlob(ctx context.Context, opts downloadOpts) (cacheHit bool, _ error) {
 	fp, err := GetBlobsPath(opts.digest)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	fi, err := os.Stat(fp)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 	case err != nil:
-		return err
+		return false, err
 	default:
 		opts.fn(api.ProgressResponse{
 			Status:    fmt.Sprintf("pulling %s", opts.digest[7:19]),
@@ -358,7 +432,7 @@ func downloadBlob(ctx context.Context, opts downloadOpts) error {
 			Completed: fi.Size(),
 		})
 
-		return nil
+		return true, nil
 	}
 
 	data, ok := blobDownloadManager.LoadOrStore(opts.digest, &blobDownload{Name: fp, Digest: opts.digest})
@@ -368,12 +442,12 @@ func downloadBlob(ctx context.Context, opts downloadOpts) error {
 		requestURL = requestURL.JoinPath("v2", opts.mp.GetNamespaceRepository(), "blobs", opts.digest)
 		if err := download.Prepare(ctx, requestURL, opts.regOpts); err != nil {
 			blobDownloadManager.Delete(opts.digest)
-			return err
+			return false, err
 		}
 
-		// nolint: contextcheck
+		//nolint:contextcheck
 		go download.Run(context.Background(), requestURL, opts.regOpts)
 	}
 
-	return download.Wait(ctx, opts.fn)
+	return false, download.Wait(ctx, opts.fn)
 }
